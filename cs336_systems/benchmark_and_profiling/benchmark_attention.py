@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 
 from itertools import product
+from typing import Callable
 
 from cs336_basics.model import scaled_dot_product_attention
 
@@ -15,7 +16,8 @@ def benchmark_attention(
   batch_size: int, 
   seq_len: int, 
   d_model: int, 
-  device: torch.device
+  device: torch.device,
+  scaled_dot_product_attention_func: Callable,
 ):
   try:
     # Clear GPU memory
@@ -30,7 +32,7 @@ def benchmark_attention(
 
     # Warmup
     for _ in range(num_warmups):
-      scaled_dot_product_attention(Q=Q, K=K, V=V)
+      scaled_dot_product_attention_func(Q=Q, K=K, V=V)
     if torch.cuda.is_available():
       torch.cuda.synchronize()
     
@@ -53,7 +55,7 @@ def benchmark_attention(
       
       # ---- 前向传播计时 -- 
       forward_start = time.time()
-      output = scaled_dot_product_attention(Q=Q, K=K, V=V)
+      output = scaled_dot_product_attention_func(Q=Q, K=K, V=V)
       loss = output.sum()
       if torch.cuda.is_available():
         torch.cuda.synchronize()
@@ -108,24 +110,49 @@ def benchmark_attention_main(num_warmups: int, num_trials: int):
   for d_model, seq_len in product(d_models, seq_lengths):
     print(f'Benchmarking d_model={d_model}, seq_len={seq_len}')
 
-    benchmark_result = benchmark_attention(
+    # Origin scaled dot-product attention benchmark
+    benchmark_origin_result = benchmark_attention(
       num_warmups=10,
       num_trials=100,
       batch_size=batch_size,
       seq_len=seq_len,
       d_model=d_model,
-      device=device
+      device=device,
+      scaled_dot_product_attention_func=scaled_dot_product_attention
     )
 
     result = {
       "d_model": d_model,
       "seq_len": seq_len,
-      **benchmark_result
+      "type": "origin",
+      **benchmark_origin_result
     }
 
+    results.append(result)
+    print(f"\tOrigin Attention, Forward_avg_time: {result["forward_time_ms"]:.2f} ms, Backward_avg_time: {result["backward_time_ms"]:.2f} ms, memory_before_backward_mb: {result["memory_before_backward_mb"]:.2f} MB")
+
+    # JIT compiled scaled dot-product attention benchmark
+    benchmark_jit_compiled_result = benchmark_attention(
+      num_warmups=10,
+      num_trials=100,
+      batch_size=batch_size,
+      seq_len=seq_len,
+      d_model=d_model,
+      device=device,
+      scaled_dot_product_attention_func=torch.compile(scaled_dot_product_attention)
+    )
+
+    result = {
+      "d_model": d_model,
+      "seq_len": seq_len,
+      "type": "JIT compiled",
+      **benchmark_jit_compiled_result
+    }
 
     results.append(result)
-    print(f"\tForward_avg_time: {result["forward_time_ms"]:.2f} ms, Backward_avg_time: {result["backward_time_ms"]:.2f} ms, memory_before_backward_mb: {result["memory_before_backward_mb"]:.2f} MB")
+    print(f"\tJIT compiled Attention, Forward_avg_time: {result["forward_time_ms"]:.2f} ms, Backward_avg_time: {result["backward_time_ms"]:.2f} ms, memory_before_backward_mb: {result["memory_before_backward_mb"]:.2f} MB")
+
+
   
   return results
 
