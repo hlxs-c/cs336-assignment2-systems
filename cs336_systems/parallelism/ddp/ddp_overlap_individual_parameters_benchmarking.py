@@ -8,7 +8,7 @@ from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy
 from cs336_basics.optimizer import AdamW
 
-from cs336_systems.parallelism.ddp.ddp_class import DDP
+from cs336_systems.parallelism.ddp.ddp_overlap_class import DDP
 from cs336_systems.parallelism.utils.utils import setup, cleanup, spawn, get_device, int_divide, summarize_tensor
 
 def broadcast_model(model: nn.Module, src_rank: int = 0):
