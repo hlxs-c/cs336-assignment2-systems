@@ -62,6 +62,7 @@ def data_parallelism_main_with_benchmarking(
     logits = model(local_batch_x)
     loss = cross_entropy(logits, local_batch_y)
     optimizer.zero_grad(set_to_none=True)
+    loss.backward()
     # 梯度同步
     for param in model.parameters():
       if param.grad is not None:
