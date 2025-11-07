@@ -26,20 +26,21 @@ class DDP(nn.Module):
     self.module = module
     self.bucket_size_bytes = bucket_size_mb * 1024**2  # 一个参数桶的内存上限
 
-    # 在一次反向传播中存储异步操作句柄和对应的梯度缓冲区
-    self.grad_handles = []
-    self.flat_grads_list = []
-
     if not dist.is_initialized():
       raise RuntimeError("torch.distributed is not initialized.")
 
     self.world_size = dist.get_world_size()
 
+    # 在一次反向传播中用于梯度同步需要存储的状态
+    # 每个元素是一个字典: {'params': [...], 'handle': None, 'flat_grad': None}, 
+    # 'params' 字段是参数桶； 'handle'是为这个参数桶里所有参数的梯度展平后执行异步all_reduce的操作句柄; flat_grad 是这个参数桶里所有参数的梯度展平后的向量
+    self.bucket_info_list = []
+
     # 1.参数广播（确保所有GPU上的参数保持一致性）
     self._broadcast_model()
 
     # 2.为每个参数注册一个在grad累积之后运行的反向钩子
-    self._register_grad_hooks()
+    self._prepare_buckets()
 
   def _broadcast_model(self):
     """
@@ -55,57 +56,57 @@ class DDP(nn.Module):
     for param in self.module.parameters():
       dist.broadcast(param.data, src=0)
 
-  def _register_grad_hooks(self):
+  def _prepare_buckets(self):
     """
-    核心逻辑: 将参数分桶, 并为每个同中最后一个计算梯度的参数注册一个钩子.
-    这个钩子将在该参数的梯度计算完成后触发, 然后也意味着这整个桶的梯度已经计算完成, 则可以对整个桶的梯度进行 all-reduce.
+    遍历参数进行分桶, 并为每个桶注册钩子.
     """
     params_with_grad = [p for p in self.module.parameters() if p.requires_grad]
-
-    # 反向遍历参数-与梯度计算的顺序一致 (从后向前), 这样可以更好地重叠计算和通信
+    
     bucket = []
     current_bucket_size = 0
 
     for param in reversed(params_with_grad):
       param_size = param.numel() * param.element_size()
-      
-      # 如果将当前参数加入桶中会超过大小限制，则处理当前桶
+
       if current_bucket_size + param_size > self.bucket_size_bytes and len(bucket) > 0:
-        self._add_hook_for_bucket(bucket)
+        self._register_hook_for_bucket(bucket)
         bucket = []
         current_bucket_size = 0
       
       bucket.append(param)
       current_bucket_size += param_size
-    
-    # 处理最后一个未满的桶
-    if len(bucket) > 0:
-      self._add_hook_for_bucket(bucket)
-  
-  def _add_hook_for_bucket(self, bucket: list[nn.Parameter]):
-    """
-    为一个桶的参数创建并注册钩子.
-    钩子会绑定在桶里面的最后一个参数上 (因为我们是反向遍历的, 所以这个参数是桶里面最晚计算出梯度的)
-    """
-    # 钩子函数将使用这个桶的参数列表
-    def hook_factory(bucket_params):
-      def _bucket_grad_hook(*args, **kwargs):
-        # 1. 将桶内所有参数的梯度拼接成一个扁平的张量
-        grads = [p.grad.data for p in bucket_params]
-        flat_grad = parameters_to_vector(grads)
-        self.flat_grads_list.append(flat_grad)
 
-        # 2. 对梯度求平均
+    if len(bucket) > 0:
+      self._register_hook_for_bucket(bucket)
+  
+  def _register_hook_for_bucket(self, bucket: list[nn.Parameter]):
+    """
+    为桶创建结构化信息, 并为触发参数注册钩子.
+    """
+    # 存储桶的参数列表
+    bucket_info = {'params': bucket}
+    self.bucket_info_list.append(bucket_info)
+
+    def hook_factory(info):
+      def _bucket_grad_hook(*args, **kwargs):
+        # 1. 将桶内所有参数的梯度拼接展平（flatten）为一个扁平的张量
+        grads = [p.grad.data for p in info['params']]
+        flat_grad = parameters_to_vector(grads)
+
+        # 2. 将创建的扁平梯度保存到桶的信息字典中
+        info['flat_grad'] = flat_grad
+
+        # 3. 对梯度求平均
         flat_grad /= self.world_size
 
-        # 3. 启动异步 all-reduce 并保存2句柄
+        # 4. 启动异步 all-reduce 并保存句柄
         handle = dist.all_reduce(flat_grad, op=dist.ReduceOp.SUM, async_op=True)
-        self.grad_handles.append((handle, bucket_params))
+        info['handle'] = handle
       return _bucket_grad_hook
 
-    # 钩子注册在桶的最后一个参数上（反向传播时的最后一个参数）
+    # 钩子注册在桶的最后一个参数上（反向传播时最晚计算梯度的参数）
     trigger_param = bucket[-1]
-    trigger_param.register_post_accumulate_grad_hook(hook_factory(bucket))
+    trigger_param.register_post_accumulate_grad_hook(hook_factory(bucket_info))
 
   def forward(self, *inputs, **kwargs):
     return self.module(*inputs, **kwargs)
@@ -114,16 +115,22 @@ class DDP(nn.Module):
     """
     该函数用于等待所有梯度同步完成, 并在完成后将同步好的扁平梯度复制回原参数的.grad属性. 通常在 optimizer.step() 之前调用.
     """
-    for handle, bucket_params in self.grad_handles:
-      handle.wait()
-    
-    flat_grad_iter = iter(self.flat_grads_list)
-    for _, bucket_params in self.grad_handles:
-      flat_grad = next(flat_grad_iter)
-      grad_views = [p.grad.data for p in bucket_params]
+    for bucket_info in self.bucket_info_list:
+      # 确保句柄已经被创建（即钩子函数已经在反向传播过程中被触发）
+      if bucket_info['handle'] is not None:
+        bucket_info['handle'].wait()
 
-      offset = 0
-      for grad in grad_views:
-        numel = grad.numel()
-        grad.copy_(flat_grad[offset:offset+numel].view_as(grad))
-        offset += numel
+        # 获取同步完成的扁平梯度
+        synced_flat_grad = bucket_info['flat_grad']
+
+        # 获取桶内参数对应的 .grad 属性列表
+        # 注意：这里传递的是参数的 .grad 属性本身，而不是 .grad.data，因为之后的 vector_to_parameters 会直接修改这些张量的内容
+        grads_to_update = [p.grad for p in bucket_info['params']]
+
+        # 将扁平梯度的数据复制回各个参数的 .grad 字段
+        vector_to_parameters(synced_flat_grad, grads_to_update)
+
+        # 重置当前迭代留下的状态（句柄和梯度缓冲区），为下一轮做准备
+        # 注意：不能直接清空self.bucket_info_list，因为分桶只会做一次，所以bucket_info_list也只会把每个桶的状态结构构建一次，之后都是直接修改
+        bucket_info['handle'] = None
+        bucket_info['flat_grad'] = None
