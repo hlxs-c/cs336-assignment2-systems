@@ -90,7 +90,13 @@ class DDP(nn.Module):
     def hook_factory(info):
       def _bucket_grad_hook(*args, **kwargs):
         # 1. 将桶内所有参数的梯度拼接展平（flatten）为一个扁平的张量
-        grads = [p.grad.data for p in info['params']]
+        grads = []
+        for p in info['params']:
+          if p.grad is None:
+            # 如果参数没有梯度，创建一个零张量替代
+            grads.append(torch.zeros_like(p.data))
+          else:
+            grads.append(p.grad.data)
         flat_grad = parameters_to_vector(grads)
 
         # 2. 将创建的扁平梯度保存到桶的信息字典中
